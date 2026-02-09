@@ -18,10 +18,6 @@ BINGO_ITEMS = [
     "Work Van with Signage", "Trailer", "Letterbox", "Speed Limit Sign", "Ladder"
 ]
 os.makedirs(SAVE_DIR, exist_ok=True)
-try:
-    os.remove(MAP_CSV)
-except FileNotFoundError:
-    pass
 found_items = {}
 
 def get_lat_lng_screenshot(label):
@@ -34,12 +30,12 @@ def get_lat_lng_screenshot(label):
             try:
                 url_bar = main_chrome_winspec.child_window(control_type="Edit")
                 url = url_bar.window_text()
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                filename = f"{label}_{timestamp}.png".replace(" ", "_")
+                path = os.path.join(SAVE_DIR, filename)
+                main_chrome_winspec.capture_as_image().save(path)
                 match = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', url)
                 if match:
-                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                    filename = f"{label}_{timestamp}.png".replace(" ", "_")
-                    path = os.path.join(SAVE_DIR, filename)
-                    main_chrome_winspec.capture_as_image().save(path)
                     return float(match.group(1)), float(match.group(2)), path
             except Exception:
                 pass
@@ -48,7 +44,6 @@ def get_lat_lng_screenshot(label):
 # =====================
 # Map output
 # =====================
-# === CHANGED: make generate_map_outputs append a single row per click.
 def generate_map_outputs(label, data):
     """Append (Name, Latitude, Longitude, Description) to MAP_CSV.
        Creates file with header if it doesn't exist or is empty."""
@@ -68,12 +63,108 @@ def generate_map_outputs(label, data):
     print(f"Appended row for '{label}' to {MAP_CSV}")
 
 # =====================
+# Helpers
+# =====================
+def _fmt_mmss(seconds: int) -> str:
+    m, s = divmod(max(int(seconds), 0), 60)
+    return f"{m:02d}:{s:02d}"
+
+# =====================
 # UI callbacks
 # =====================
-def bingo_click(label, button):
-    if label in found_items:
+def apply_enabled_state(*_):
+    state = "normal" if enabled.get() else "disabled"
+    for b in btns:
+        b.config(state=state)
+
+# --- TIMER: state and functions ---------------------------------------------
+remaining_secs = 0
+total_secs = 0              # store the starting duration in seconds
+_timer_job = None
+_game_finished = False      # prevent double-finalization
+
+def _update_timer_label():
+    timer_label.config(text=_fmt_mmss(remaining_secs))
+
+def _end_game(reason: str):
+    """
+    Finalize the game and show summary.
+    reason: 'completed' (all 25 pressed) or 'timeout' (timer hit 0)
+    """
+    global _timer_job, _game_finished
+    if _game_finished:
         return
-    # screenshot_path = take_screenshot(label)
+    _game_finished = True
+
+    # Stop ticking
+    if _timer_job is not None:
+        root.after_cancel(_timer_job)
+        _timer_job = None
+
+    # Lock the grid after end
+    for b in btns:
+        b.config(state="disabled")
+
+    # Counts
+    disabled_count = sum(1 for b in btns if b.cget("state") == "disabled")
+    enabled_count = len(btns) - disabled_count
+
+    # Timing
+    time_taken = total_secs - remaining_secs      # elapsed = start - remaining
+
+    # Result
+    result = "WIN" if reason == "completed" else "LOSS"
+
+    summary = (
+        f"Items Found: {disabled_count} | "
+        f"Items Remaining: {enabled_count} | "
+        f"Time Taken: {_fmt_mmss(time_taken)} | "
+        f"Result: {result}"
+    )
+
+    # Show/update summary label under the grid
+    if hasattr(_end_game, "label") and _end_game.label.winfo_exists():
+        _end_game.label.config(text=summary)
+    else:
+        _end_game.label = tk.Label(results_frame, text=summary, font=("Arial", 12))
+        _end_game.label.pack(pady=(6, 10))
+
+def _tick():
+    global remaining_secs, _timer_job
+    if remaining_secs <= 0:
+        _timer_job = None
+        _end_game(reason="timeout")
+        return
+    remaining_secs -= 1
+    _update_timer_label()
+    if remaining_secs > 0:
+        _timer_job = root.after(1000, _tick)
+    else:
+        _timer_job = None
+        _end_game(reason="timeout")
+
+def _start_timer(start_minutes: int):
+    """Initialize and start the countdown from start_minutes."""
+    global remaining_secs, total_secs, _timer_job, _game_finished
+    _game_finished = False
+
+    if _timer_job is not None:
+        root.after_cancel(_timer_job)
+
+    total_secs = max(int(start_minutes) * 60, 0)   # store the start duration
+    remaining_secs = total_secs
+    _update_timer_label()
+
+    if remaining_secs > 0:
+        _timer_job = root.after(1000, _tick)
+    else:
+        _timer_job = None
+        _end_game(reason="timeout")
+
+def bingo_click(label, button):
+    if label in found_items or _game_finished:   # prevent late clicks post-end
+        return
+
     lat, lng, screenshot_path = get_lat_lng_screenshot(label)
     if lat is None or lng is None:
         print(f"Warning: could not read coordinates for {label}")
@@ -87,71 +178,16 @@ def bingo_click(label, button):
     print(f"{label}: {lat}, {lng}")
     button.config(bg="green", state="disabled")
 
-    # === CHANGED: append to CSV immediately for progressive build.
+    # Progressive append to CSV
     generate_map_outputs(label, found_items[label])
 
-    # (Removed the previous: if len(found_items) == 25: ... generate all and quit)
-
-def apply_enabled_state(*_):
-    state = "normal" if enabled.get() else "disabled"
-    for b in btns:
-        b.config(state=state)
-
-# --- TIMER: state and functions (from previous step, extended) ---------------
-remaining_secs = 0
-_timer_job = None
-
-def _update_timer_label():
-    m, s = divmod(max(remaining_secs, 0), 60)
-    timer_label.config(text=f"{m:02d}:{s:02d}")
-
-def _show_final_counts():
-    """Create/update a label below the grid showing enabled/disabled counts."""
-    enabled_count = sum(1 for b in btns if b.cget("state") == "normal")
-    disabled_count = len(btns) - enabled_count
-    txt = f"Time up: Items Found: {disabled_count} | Items Remaining:  {enabled_count}"
-
-    # If the label already exists, just update; otherwise create it.
-    if hasattr(_show_final_counts, "label") and _show_final_counts.label.winfo_exists():
-        _show_final_counts.label.config(text=txt)
-    else:
-        _show_final_counts.label = tk.Label(results_frame, text=txt, font=("Arial", 12))
-        _show_final_counts.label.pack(pady=(6, 10))
-
-def _tick():
-    global remaining_secs, _timer_job
-    if remaining_secs <= 0:
-        _timer_job = None
-        # === NEW: when timer hits 0, post final counts below grid.
-        _show_final_counts()
-        return
-    remaining_secs -= 1
-    _update_timer_label()
-    if remaining_secs > 0:
-        _timer_job = root.after(1000, _tick)
-    else:
-        _timer_job = None
-        _show_final_counts()  # === NEW: also handle edge case landing exactly on zero.
-
-def _start_timer(start_minutes: int):
-    """Initialize and start the countdown from start_minutes."""
-    global remaining_secs, _timer_job
-    if _timer_job is not None:
-        root.after_cancel(_timer_job)
-    remaining_secs = max(int(start_minutes) * 60, 0)
-    _update_timer_label()
-    if remaining_secs > 0:
-        _timer_job = root.after(1000, _tick)
-    else:
-        _timer_job = None
-        _show_final_counts()
+    # End condition: if every grid button is disabled, end as a WIN
+    if all(b.cget("state") == "disabled" for b in btns):
+        _end_game(reason="completed")
 
 def start_game(button):
-    # Enable grid
-    enabled.set(not enabled.get())  # trace handler will run and update all
+    enabled.set(not enabled.get())
     button.config(state="disabled")
-
-    # Start countdown from Spinbox minutes
     try:
         minutes = int(var.get())
         if minutes < 0:
@@ -159,6 +195,10 @@ def start_game(button):
     except ValueError:
         minutes = 0
         var.set("0")
+
+    # Clear any previous summary label for a new run (optional nicety)
+    if hasattr(_end_game, "label") and _end_game.label.winfo_exists():
+        _end_game.label.config(text="")
 
     _start_timer(minutes)
 
@@ -177,7 +217,7 @@ header1 = tk.Label(header_frame, text="Google Maps Bingo!", font=("Arial", 20))
 header2 = tk.Label(header_frame, text="Time Limit (mins)")
 var = StringVar()
 var.set("10")
-header3 = tk.Spinbox(header_frame, from_=1, to=30, width=5, textvariable=var, justify="center")
+header3 = tk.Spinbox(header_frame, from_=0, to=30, width=5, textvariable=var, justify="center")
 header4 = tk.Button(header_frame, text="Start Game")
 header4.config(command=lambda b=header4: start_game(b), state="normal")
 
@@ -209,10 +249,8 @@ for i, label in enumerate(BINGO_ITEMS):
 enabled.trace_add("write", apply_enabled_state)
 button_frame.pack(padx=10, pady=10)
 
-# === NEW: Results frame to show final counts under the grid when time is up.
+# Results area for the final summary below the grid
 results_frame = tk.Frame(root)
-_show_final_counts.label = tk.Label(results_frame, text="Results", font=("Arial", 12))
-_show_final_counts.label.pack(pady=(6, 10))
-results_frame.pack(fill="x")  # empty initially; label created on demand
+results_frame.pack(fill="x")  # summary label gets created on demand at end
 
 root.mainloop()
